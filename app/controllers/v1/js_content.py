@@ -10,6 +10,7 @@ from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.controllers.v1.video import create_task
 from app.models.schema import TaskResponse, TaskVideoRequest
+from app.services.js_content.assets import bind_product_assets_to_storyboard
 from app.services.js_content.product import ProductInput, generate_product_storyboard
 from app.services.js_content.render_bridge import storyboard_to_video_params
 from app.services.js_content.scene_render import build_scene_render_manifest
@@ -44,6 +45,7 @@ class ProductVideoRequest(BaseModel):
 class ProductVideoPlanResponse(BaseModel):
     storyboard: dict
     render_manifest: dict
+    asset_manifest: dict
     video_params: dict
 
 
@@ -77,8 +79,18 @@ def _build_storyboard(body: ProductVideoRequest):
     summary="Plan a product video using JS Content Brain",
 )
 def plan_product_video(body: ProductVideoRequest):
-    storyboard = _build_storyboard(body)
+    product = _build_product(body)
+    storyboard = generate_product_storyboard(
+        product,
+        fallback_to_scaffold=body.fallback_to_scaffold,
+        objective=body.objective,
+        platform=body.platform,
+        aspect_ratio=body.aspect_ratio,
+        duration_seconds=body.duration_seconds,
+        brand_key=body.brand,
+    )
     manifest = build_scene_render_manifest(storyboard)
+    assets = bind_product_assets_to_storyboard(product, storyboard)
     params = storyboard_to_video_params(
         storyboard,
         subject=body.product,
@@ -101,6 +113,9 @@ def plan_product_video(body: ProductVideoRequest):
             "cta": manifest.cta,
             "total_duration_seconds": manifest.total_duration_seconds,
             "scenes": [asdict(scene) for scene in manifest.scenes],
+        },
+        asset_manifest={
+            "bindings": [asdict(binding) for binding in assets.bindings],
         },
         video_params=params.model_dump(),
     )
