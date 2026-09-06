@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from .models import ContentBrief
 from .planner import generate_ai_storyboard
