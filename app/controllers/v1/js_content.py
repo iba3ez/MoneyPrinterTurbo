@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Dict, List
 
 from fastapi import Depends, Request
@@ -46,13 +47,8 @@ class ProductVideoPlanResponse(BaseModel):
     video_params: dict
 
 
-@router.post(
-    "/js/product-video/plan",
-    response_model=ProductVideoPlanResponse,
-    summary="Plan a product video using JS Content Brain",
-)
-def plan_product_video(body: ProductVideoRequest):
-    product = ProductInput(
+def _build_product(body: ProductVideoRequest) -> ProductInput:
+    return ProductInput(
         name=body.product,
         price=body.price,
         description=body.description,
@@ -61,8 +57,11 @@ def plan_product_video(body: ProductVideoRequest):
         image_urls=tuple(str(url) for url in body.image_urls),
         marketplace=body.marketplace,
     )
-    storyboard = generate_product_storyboard(
-        product,
+
+
+def _build_storyboard(body: ProductVideoRequest):
+    return generate_product_storyboard(
+        _build_product(body),
         fallback_to_scaffold=body.fallback_to_scaffold,
         objective=body.objective,
         platform=body.platform,
@@ -70,6 +69,15 @@ def plan_product_video(body: ProductVideoRequest):
         duration_seconds=body.duration_seconds,
         brand_key=body.brand,
     )
+
+
+@router.post(
+    "/js/product-video/plan",
+    response_model=ProductVideoPlanResponse,
+    summary="Plan a product video using JS Content Brain",
+)
+def plan_product_video(body: ProductVideoRequest):
+    storyboard = _build_storyboard(body)
     manifest = build_scene_render_manifest(storyboard)
     params = storyboard_to_video_params(
         storyboard,
@@ -85,14 +93,14 @@ def plan_product_video(body: ProductVideoRequest):
             "hook": storyboard.hook,
             "cta": storyboard.cta,
             "metadata": storyboard.metadata,
-            "scenes": [scene.__dict__ for scene in storyboard.scenes],
+            "scenes": [asdict(scene) for scene in storyboard.scenes],
         },
         render_manifest={
             "title": manifest.title,
             "hook": manifest.hook,
             "cta": manifest.cta,
             "total_duration_seconds": manifest.total_duration_seconds,
-            "scenes": [scene.__dict__ for scene in manifest.scenes],
+            "scenes": [asdict(scene) for scene in manifest.scenes],
         },
         video_params=params.model_dump(),
     )
@@ -104,24 +112,7 @@ def plan_product_video(body: ProductVideoRequest):
     summary="Generate a product video using JS Content Brain",
 )
 def create_product_video(request: Request, body: ProductVideoRequest):
-    product = ProductInput(
-        name=body.product,
-        price=body.price,
-        description=body.description,
-        specs=body.specs,
-        source_url=str(body.source_url or ""),
-        image_urls=tuple(str(url) for url in body.image_urls),
-        marketplace=body.marketplace,
-    )
-    storyboard = generate_product_storyboard(
-        product,
-        fallback_to_scaffold=body.fallback_to_scaffold,
-        objective=body.objective,
-        platform=body.platform,
-        aspect_ratio=body.aspect_ratio,
-        duration_seconds=body.duration_seconds,
-        brand_key=body.brand,
-    )
+    storyboard = _build_storyboard(body)
     params = storyboard_to_video_params(
         storyboard,
         subject=body.product,
