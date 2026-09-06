@@ -91,7 +91,32 @@ class SceneAssetResolution:
         return {
             "assets": [asset.to_dict() for asset in self.assets],
             "all_scenes_local": self.all_scenes_local,
+            "local_timeline_supported": self.all_scenes_local,
+            "planning_notes": self.planning_notes(),
         }
+
+    def planning_notes(self) -> tuple[str, ...]:
+        """Explicit planner metadata for mixed local/stock timelines.
+
+        The upstream renderer consumes either a full local timeline or the
+        stock workflow — it has no per-scene mixed mode. When only some scenes
+        resolve to local media, the local assets must NOT be assembled into a
+        partial timeline (that would silently drop the remaining scenes); the
+        whole task falls back to the stock workflow instead.
+        """
+
+        if not self.assets or self.all_scenes_local:
+            return ()
+        local_count = sum(1 for asset in self.assets if asset.is_local_media)
+        if not local_count:
+            return ()
+        return (
+            (
+                "mixed-local timeline is not supported yet: "
+                f"{local_count} of {len(self.assets)} scenes resolved to local "
+                "media, remaining scenes fall back to the stock workflow"
+            ),
+        )
 
 
 def resolve_scene_assets(

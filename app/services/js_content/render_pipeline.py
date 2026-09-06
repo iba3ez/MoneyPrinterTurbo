@@ -19,7 +19,6 @@ from .image_clip import (
     MAX_IMAGE_CLIPS_PER_REQUEST,
     ImageClipRenderError,
     render_image_clip,
-    resolve_clip_storage_key,
     resolve_local_image_asset,
 )
 from .image_clip_models import (
@@ -33,6 +32,7 @@ from .image_clip_models import (
     ImageClipManifest,
     ImageClipPlan,
     ImageClipSettings,
+    to_storage_key,
 )
 from .models import Storyboard
 from .scene_assets import SceneAssetResolution, resolve_scene_assets
@@ -228,55 +228,60 @@ def _annotate_planned_clips(
     return SceneAssetResolution(assets=tuple(assets))
 
 
-def attach_clip_materials(
+def attach_resolved_scene_materials(
     params: VideoParams,
-    plans: tuple[ImageClipPlan, ...],
-    local_video_materials: tuple[str, ...] = (),
+    resolution: SceneAssetResolution,
+    *,
+    max_scene_duration_seconds: float | None = None,
 ) -> VideoParams:
-    """Switch params onto the local-material renderer path with scene order.
+    """Switch params onto the local-material renderer path using the resolver.
 
-    Only scene clips that have actually been rendered can enter the timeline.
-    Storage keys (never absolute server paths) are written into
-    ``video_materials``; the upstream renderer re-resolves them inside the
-    ``storage/local_videos`` whitelist directory.
+    ``SceneAssetResolution`` is the single source of truth: materials are the
+    local-media assets (priority 1–2) ordered by ``scene_index``, and no
+    additional priority logic runs here. When the resolver reports a mixed
+    local/stock timeline, the local assets are NOT assembled into a partial
+    timeline — params are returned untouched so the existing stock workflow
+    covers every scene (planning metadata in the manifest explains why).
     """
 
-    rendered = [clip for clip in plans if clip.output_path]
-    ordered_clips = sorted(rendered, key=lambda clip: clip.scene_index)
+    if not resolution.all_scenes_local:
+        if resolution.planning_notes():
+            logger.warning(
+                "falling back to stock workflow: " + " ".join(resolution.planning_notes())
+            )
+        return params
+
+    ordered_assets = sorted(resolution.assets, key=lambda asset: asset.scene_index)
     materials = [
         MaterialInfo(
             provider="local",
-            url=resolve_clip_storage_key(clip.output_path),
+            url=to_storage_key(asset.asset_uri),
             duration=0,
-            source_info={"provider": "image-to-clip", "scene": clip.scene_index},
+            source_info={
+                "provider": "js-scene-resolver",
+                "scene": asset.scene_index,
+                "priority_label": asset.priority_label,
+            },
         )
-        for clip in ordered_clips
+        for asset in ordered_assets
+        if asset.asset_uri
     ]
-    materials.extend(
-        MaterialInfo(provider="local", url=str(uri), duration=0)
-        for uri in local_video_materials
-        if str(uri or "").strip()
-    )
     if not materials:
+        # Plan stage: every scene is planned local but no clip is rendered yet.
         return params
 
-    max_scene_duration = max(
-        (clip.duration_seconds for clip in rendered),
-        default=params.video_clip_duration,
-    )
     data = params.model_dump()
     data.update(
         {
             "video_source": "local",
             "video_materials": materials,
             "match_materials_to_script": True,
-            # Each scene clip must play to its storyboard duration, so the
-            # renderer's per-clip cap is raised to the longest scene.
-            "video_clip_duration": max(
-                1, int(round(max_scene_duration))
-            ),
         }
     )
+    if max_scene_duration_seconds is not None:
+        # Each scene clip must play to its storyboard duration, so the
+        # renderer's per-clip cap is raised to the longest scene.
+        data["video_clip_duration"] = max(1, int(round(max_scene_duration_seconds)))
     return VideoParams(**data)
 
 

@@ -10,6 +10,7 @@ import pytest
 from app.services.js_content.image_clip import (
     build_image_clip_command,
     build_zoompan_filter,
+    probe_clip_dimensions,
     probe_clip_duration,
     render_image_clip,
     resolve_local_image_asset,
@@ -23,11 +24,12 @@ from app.services.js_content.image_clip_models import (
 )
 from app.services.js_content.models import Scene, Storyboard
 from app.services.js_content.render_pipeline import (
-    attach_clip_materials,
+    attach_resolved_scene_materials,
     build_image_clip_manifest,
     build_image_clip_plans,
     prepare_image_clip_assets,
 )
+from app.services.js_content.scene_assets import resolve_scene_assets
 from app.models.schema import VideoParams
 from app.utils import utils
 
@@ -195,6 +197,57 @@ def test_image_motion_modes():
     assert "on/47" in right and "(1-on/47)" not in right
 
 
+def test_static_clip_output_resolution():
+    """Static motion must land on the exact target resolution for all aspects."""
+
+    settings = _make_settings()
+    static_plan = ImageClipPlan(
+        scene_index=1, source_image="a.png", duration_seconds=1, motion="static"
+    )
+    # Filter level: without zoompan, normalization must target WxH directly.
+    command = build_image_clip_command(static_plan, settings, "out.mp4")
+    filter_string = command[command.index("-filter_complex") + 1]
+    assert "scale=1080:1920" in filter_string
+    assert "scale=2160:3840" not in filter_string
+    assert "crop=1080:1920" in filter_string
+    # Animated motions keep the 2x zoom headroom and downsample via zoompan.
+    motion_plan = ImageClipPlan(
+        scene_index=1,
+        source_image="a.png",
+        duration_seconds=1,
+        motion="zoom-in",
+        zoom_end=1.3,
+    )
+    motion_filter = build_image_clip_command(motion_plan, settings, "out.mp4")
+    motion_string = motion_filter[motion_filter.index("-filter_complex") + 1]
+    assert "scale=2160:3840" in motion_string
+    assert "s=1080x1920" in motion_string
+
+    if not FFMPEG_AVAILABLE:
+        pytest.skip("ffmpeg is not available")
+
+    image = str(_RESOURCES / "1.png")
+    for aspect_ratio, expected in (
+        ("9:16", (1080, 1920)),
+        ("16:9", (1920, 1080)),
+        ("1:1", (1080, 1080)),
+    ):
+        clip_settings = ImageClipSettings.for_aspect_ratio(aspect_ratio, fps=24)
+        plan = ImageClipPlan(
+            scene_index=1, source_image=image, duration_seconds=0.5, motion="static"
+        )
+        rendered = render_image_clip(plan, clip_settings, enable_overlay=False)
+        try:
+            dimensions = probe_clip_dimensions(rendered.output_path)
+            assert dimensions == expected, (
+                f"{aspect_ratio} static clip rendered {dimensions}, "
+                f"expected {expected}"
+            )
+        finally:
+            if os.path.exists(rendered.output_path):
+                os.remove(rendered.output_path)
+
+
 def test_product_image_to_clip_manifest(tmp_path, monkeypatch):
     storage_root = tmp_path / "storage"
     local_videos = storage_root / "local_videos"
@@ -236,9 +289,18 @@ def test_product_image_to_clip_manifest(tmp_path, monkeypatch):
             probed = probe_clip_duration(clip.output_path)
             assert probed is not None
             assert abs(probed - clip.duration_seconds) <= DURATION_TOLERANCE_SECONDS
-        # Params must carry storage keys only, never absolute paths.
-        params = attach_clip_materials(VideoParams(video_subject="t"), plans)
+        # Params must carry storage keys only, never absolute paths, and the
+        # resolver-driven attach must produce a full local timeline.
+        resolution = resolve_scene_assets(storyboard, image_clips=tuple(plans))
+        params = attach_resolved_scene_materials(
+            VideoParams(video_subject="t"),
+            resolution,
+            max_scene_duration_seconds=max(
+                clip.duration_seconds for clip in plans
+            ),
+        )
         assert params.video_source == "local"
+        assert len(params.video_materials) == len(plans)
         for material in params.video_materials:
             assert not os.path.isabs(material.url)
             assert material.url.replace("\\", "/").startswith("js-image-clips/")

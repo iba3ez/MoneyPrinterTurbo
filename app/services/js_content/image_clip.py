@@ -36,6 +36,7 @@ CLIP_OUTPUT_SUBDIR = "js-image-clips"
 CLIP_RENDER_TIMEOUT_SECONDS = 120
 MAX_IMAGE_CLIPS_PER_REQUEST = 10
 _DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)")
+_DIMENSIONS_PATTERN = re.compile(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})[,\s]")
 
 
 class ImageClipRenderError(RuntimeError):
@@ -81,13 +82,25 @@ def _escape_drawtext_path(path: str) -> str:
     return escaped
 
 
-def build_normalization_filters(settings: ImageClipSettings) -> list[str]:
-    """Aspect-preserving cover normalization: scale then crop, never distort."""
+def build_normalization_filters(
+    settings: ImageClipSettings,
+    *,
+    upscale_for_zoompan: bool = False,
+) -> list[str]:
+    """Aspect-preserving cover normalization: scale then crop, never distort.
+
+    The output of this stage always targets the settings resolution. When a
+    zoompan filter follows, the frame is pre-scaled to a 2x canvas so animated
+    zoom keeps quality; zoompan itself downsamples to the exact target
+    resolution via its ``s`` option. Without zoompan (``static`` motion) the
+    chain must land on the target resolution directly.
+    """
 
     width, height = settings.width, settings.height
-    # zoompan operates on the pre-scaled frame so animated zoom keeps quality;
-    # the margin covers the maximum allowed zoom factor.
-    canvas_width, canvas_height = width * 2, height * 2
+    if upscale_for_zoompan:
+        canvas_width, canvas_height = width * 2, height * 2
+    else:
+        canvas_width, canvas_height = width, height
     return [
         (
             f"scale={canvas_width}:{canvas_height}"
@@ -163,7 +176,12 @@ def build_image_clip_command(
         # A single input frame is enough: zoompan duplicates it into `frames`.
         command += ["-i", plan.source_image]
 
-    filters = build_normalization_filters(settings)
+    filters = build_normalization_filters(
+        settings,
+        # Only animated motions downsample through zoompan's s=WxH option;
+        # static must land on the target resolution in this stage directly.
+        upscale_for_zoompan=plan.motion != MOTION_STATIC,
+    )
     if plan.motion != MOTION_STATIC:
         filters.append(build_zoompan_filter(plan, settings, frames))
     filters.extend(overlay_filters or [])
@@ -292,6 +310,32 @@ def probe_clip_duration(
         return None
     hours, minutes, seconds, centiseconds = (int(part) for part in match.groups())
     return hours * 3600 + minutes * 60 + seconds + centiseconds / 100
+
+
+def probe_clip_dimensions(
+    video_path: str, timeout_seconds: int = 30
+) -> tuple[int, int] | None:
+    """Probe a rendered clip's (width, height), or None when unreadable."""
+
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-nostdin",
+        "-hide_banner",
+        "-i",
+        video_path,
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, timeout=timeout_seconds, check=False
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    match = _DIMENSIONS_PATTERN.search(
+        completed.stderr.decode("utf-8", errors="replace")
+    )
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def resolve_clip_storage_key(output_path: str) -> str:

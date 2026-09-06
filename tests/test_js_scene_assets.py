@@ -7,6 +7,7 @@ import pytest
 from app.services.js_content.assets import SceneAssetBinding, SceneAssetManifest
 from app.services.js_content.image_clip_models import ImageClipPlan
 from app.services.js_content.models import Scene, Storyboard
+from app.services.js_content.render_pipeline import attach_resolved_scene_materials
 from app.services.js_content.scene_assets import (
     PRIORITY_AI_MEDIA,
     PRIORITY_IMAGE_CLIP,
@@ -17,6 +18,7 @@ from app.services.js_content.scene_assets import (
     resolve_scene_assets,
 )
 from app.services.js_content.image_clip import resolve_local_image_asset
+from app.models.schema import VideoParams
 from app.utils import utils
 
 
@@ -157,3 +159,118 @@ def test_path_traversal_rejected(tmp_path, monkeypatch):
     except (OSError, NotImplementedError):
         # Windows may deny symlink creation without privileges.
         pass
+
+
+def _three_scene_storyboard() -> Storyboard:
+    return Storyboard.from_scenes(
+        title="Order",
+        hook="Hook",
+        scenes=(
+            Scene(index=1, duration_seconds=4, narration="a", visual_prompt="prompt a"),
+            Scene(index=2, duration_seconds=5, narration="b", visual_prompt="prompt b"),
+            Scene(index=3, duration_seconds=4, narration="c", visual_prompt="prompt c"),
+        ),
+    )
+
+
+def _rendered_clip(scene_index: int, duration: float = 4.0) -> ImageClipPlan:
+    return ImageClipPlan(
+        scene_index=scene_index,
+        source_image="a.png",
+        duration_seconds=duration,
+        output_path=f"js-image-clips/clip-{scene_index}.mp4",
+    )
+
+
+def test_renderer_material_order_matches_scene_resolution():
+    storyboard = _three_scene_storyboard()
+    resolution = resolve_scene_assets(
+        storyboard,
+        image_clips=(_rendered_clip(2), _rendered_clip(3)),
+        local_video_materials=("uploaded-video.mp4",),
+    )
+    params = attach_resolved_scene_materials(
+        VideoParams(video_subject="t"),
+        resolution,
+        max_scene_duration_seconds=5.0,
+    )
+
+    # Payload order must follow scene_index: scene 1 local video, then clips.
+    urls = [material.url.replace("\\", "/") for material in params.video_materials]
+    assert urls == [
+        "uploaded-video.mp4",
+        "js-image-clips/clip-2.mp4",
+        "js-image-clips/clip-3.mp4",
+    ]
+    scenes = [material.source_info["scene"] for material in params.video_materials]
+    assert scenes == [1, 2, 3]
+    assert params.video_source == "local"
+    assert params.match_materials_to_script is True
+    assert params.video_clip_duration == 5
+    assert resolution.to_dict()["local_timeline_supported"] is True
+
+
+def test_local_video_overrides_image_clip_for_same_scene():
+    storyboard = _three_scene_storyboard()
+    clips = (_rendered_clip(1), _rendered_clip(2), _rendered_clip(3))
+    resolution = resolve_scene_assets(
+        storyboard,
+        image_clips=clips,
+        # Local videos occupy the first scene slots, overriding the clips.
+        local_video_materials=("video-a.mp4",),
+    )
+    by_scene = {asset.scene_index: asset for asset in resolution.assets}
+    assert by_scene[1].priority == PRIORITY_LOCAL_VIDEO
+    assert by_scene[1].asset_uri == "video-a.mp4"
+    assert by_scene[2].priority == PRIORITY_IMAGE_CLIP
+
+    params = attach_resolved_scene_materials(VideoParams(video_subject="t"), resolution)
+    urls = [material.url.replace("\\", "/") for material in params.video_materials]
+    assert urls == [
+        "video-a.mp4",
+        "js-image-clips/clip-2.mp4",
+        "js-image-clips/clip-3.mp4",
+    ]
+
+
+def test_mixed_local_stock_does_not_drop_scenes():
+    storyboard = _three_scene_storyboard()
+    resolution = resolve_scene_assets(
+        storyboard,
+        # Only scene 1 carries local media; scenes 2-3 fall to visual prompts.
+        local_video_materials=("only-video.mp4",),
+    )
+    assert resolution.all_scenes_local is False
+    notes = resolution.planning_notes()
+    assert notes and "mixed-local" in notes[0]
+    assert resolution.to_dict()["local_timeline_supported"] is False
+
+    params_before = VideoParams(video_subject="t", video_source="pexels")
+    params_after = attach_resolved_scene_materials(params_before, resolution)
+
+    # No partial local timeline: params untouched, every scene stays covered
+    # by the existing stock workflow instead of silently dropping scenes.
+    assert params_after.video_source == "pexels"
+    assert params_after.video_materials is None
+    assert params_after.model_dump() == params_before.model_dump()
+    assert len(resolution.assets) == len(storyboard.scenes)
+
+
+def test_all_local_scenes_switch_video_source_to_local():
+    storyboard = _three_scene_storyboard()
+    resolution = resolve_scene_assets(
+        storyboard,
+        image_clips=(_rendered_clip(1, 4.0), _rendered_clip(2, 5.0), _rendered_clip(3, 4.0)),
+    )
+    assert resolution.all_scenes_local is True
+
+    params_before = VideoParams(video_subject="t", video_source="pexels")
+    params_after = attach_resolved_scene_materials(
+        params_before,
+        resolution,
+        max_scene_duration_seconds=5.0,
+    )
+    assert params_before.video_source == "pexels"
+    assert params_after.video_source == "local"
+    assert len(params_after.video_materials) == 3
+    assert params_after.video_clip_duration == 5

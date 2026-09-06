@@ -25,7 +25,7 @@ from app.services.js_content.news import NewsInput, NewsSource, generate_news_st
 from app.services.js_content.product import ProductInput, generate_product_storyboard
 from app.services.js_content.render_bridge import storyboard_to_video_params
 from app.services.js_content.render_pipeline import (
-    attach_clip_materials,
+    attach_resolved_scene_materials,
     prepare_image_clip_assets,
 )
 from app.services.js_content.scene_render import build_scene_render_manifest
@@ -267,7 +267,14 @@ def _resolve_local_video_keys(filenames: List[str]) -> tuple[str, ...]:
     return tuple(to_storage_key(material.url) for material in materials)
 
 
-def _prepare_product_image_clip_assets(body: ProductImageVideoRequest, storyboard, assets, *, render: bool):
+def _prepare_product_image_clip_assets(
+    body: ProductImageVideoRequest,
+    storyboard,
+    assets,
+    *,
+    render: bool,
+    local_video_materials: tuple[str, ...] = (),
+):
     settings = ImageClipSettings.for_aspect_ratio(
         body.aspect_ratio, fps=body.clip_options.fps
     )
@@ -276,6 +283,7 @@ def _prepare_product_image_clip_assets(body: ProductImageVideoRequest, storyboar
             storyboard,
             local_image_files=tuple(body.local_image_files),
             asset_manifest=assets,
+            local_video_materials=local_video_materials,
             price_text=body.price,
             badge_text=body.clip_options.badge_text,
             brand_key=body.brand,
@@ -300,9 +308,12 @@ def plan_product_image_video(request: Request, body: ProductImageVideoRequest):
     product = _build_product(body)
     storyboard = _build_product_storyboard(body)
     assets = bind_product_assets_to_storyboard(product, storyboard)
+    # Validation happens here (400 on invalid names); the resulting storage
+    # keys flow into the scene resolver, which owns all priority decisions.
     local_video_keys = _resolve_local_video_keys(body.local_video_materials)
     clip_manifest, resolution, plans = _prepare_product_image_clip_assets(
-        body, storyboard, assets, render=False
+        body, storyboard, assets, render=False,
+        local_video_materials=local_video_keys,
     )
     params = storyboard_to_video_params(
         storyboard,
@@ -312,7 +323,10 @@ def plan_product_image_video(request: Request, body: ProductImageVideoRequest):
         voice_name=body.voice_name,
         bgm_type=body.bgm_type,
     )
-    params = attach_clip_materials(params, plans, local_video_keys)
+    # Plan stage: planned clips carry no output yet, so the resolution keeps
+    # the stock workflow params unless uploaded local videos already cover
+    # every scene. planning_notes explains any mixed-local fallback.
+    params = attach_resolved_scene_materials(params, resolution)
     return ProductImageVideoPlanResponse(
         storyboard=_storyboard_payload(storyboard),
         asset_manifest={
@@ -346,9 +360,12 @@ def build_product_image_video_params(body: ProductImageVideoRequest):
     product = _build_product(body)
     storyboard = _build_product_storyboard(body)
     assets = bind_product_assets_to_storyboard(product, storyboard)
+    # Validation happens here (400 on invalid names); the resulting storage
+    # keys flow into the scene resolver, which owns all priority decisions.
     local_video_keys = _resolve_local_video_keys(body.local_video_materials)
-    _clip_manifest, _resolution, plans = _prepare_product_image_clip_assets(
-        body, storyboard, assets, render=True
+    _clip_manifest, resolution, plans = _prepare_product_image_clip_assets(
+        body, storyboard, assets, render=True,
+        local_video_materials=local_video_keys,
     )
     params = storyboard_to_video_params(
         storyboard,
@@ -358,7 +375,19 @@ def build_product_image_video_params(body: ProductImageVideoRequest):
         voice_name=body.voice_name,
         bgm_type=body.bgm_type,
     )
-    return attach_clip_materials(params, plans, local_video_keys)
+    rendered_plans = [clip for clip in plans if clip.output_path]
+    max_scene_duration = (
+        max(clip.duration_seconds for clip in rendered_plans)
+        if rendered_plans
+        else None
+    )
+    # The scene resolver decides which assets enter the local timeline and in
+    # which order; mixed local/stock timelines fall back to the stock workflow.
+    return attach_resolved_scene_materials(
+        params,
+        resolution,
+        max_scene_duration_seconds=max_scene_duration,
+    )
 
 
 def build_news_video_params(body: NewsVideoRequest):

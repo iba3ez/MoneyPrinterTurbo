@@ -198,13 +198,25 @@ def _default_pan_direction(motion: str) -> str:
 
 
 def to_storage_key(path: str) -> str:
-    """Reduce a path under the local material directory to a portable key."""
+    """Reduce a renderer asset path to a portable storage key.
+
+    Relative keys already inside the material whitelist are returned unchanged
+    (only normalized), absolute paths under the local material directory are
+    reduced to the path after ``local_videos/``, and anything else is reduced
+    to its basename. API responses therefore never carry absolute server
+    paths, while the upstream renderer can still re-resolve every key inside
+    its whitelist directory.
+    """
 
     import os
 
     if not path:
         return ""
     normalized = os.path.normpath(path).replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not os.path.isabs(path):
+        return normalized
     marker = "local_videos/"
     position = normalized.find(marker)
     if position >= 0:
